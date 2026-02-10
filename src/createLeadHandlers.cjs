@@ -115,9 +115,44 @@ async function getPayloadSchema(adapter) {
   return schema;
 }
 
-function legacyLeadStatusBody(leadId, lead) {
+function leadForUi(leadId, lead) {
+  const attempt = Number(lead && lead.attempts ? lead.attempts : 0);
+  const emailResult =
+    (lead && lead.emailResult) || (lead && lead.result) || null;
+
+  const error =
+    lead && lead.error
+      ? {
+          stage: safeTrim(lead.stage) || "unknown",
+          message: safeTrim(lead.error.message) || "Failed",
+        }
+      : undefined;
+
   return {
     leadId,
+    correlationId: safeTrim(lead && lead.correlationId) || leadId,
+    status: safeTrim(lead && lead.status) || "unknown",
+    stage: safeTrim(lead && lead.stage) || "unknown",
+    createdAt: safeTrim(lead && lead.createdAt) || "",
+    updatedAt: safeTrim(lead && lead.updatedAt) || "",
+    doneAt: safeTrim(lead && lead.doneAt) || "",
+    attempts: attempt,
+    attempt,
+    error,
+    result: emailResult || undefined,
+  };
+}
+
+function leadStatusPayload(leadId, lead) {
+  const emailResult =
+    (lead && lead.emailResult) || (lead && lead.result) || null;
+
+  return {
+    apiStatus: "ok",
+    lead: leadForUi(leadId, lead),
+
+    leadId,
+    correlationId: safeTrim(lead && lead.correlationId) || leadId,
     status: safeTrim(lead && lead.status) || "unknown",
     stage: safeTrim(lead && lead.stage) || "unknown",
     attempts: Number(lead && lead.attempts ? lead.attempts : 0),
@@ -131,12 +166,7 @@ function legacyLeadStatusBody(leadId, lead) {
       lead && lead.pdfError
         ? { message: safeTrim(lead.pdfError.message) || "PDF failed" }
         : null,
-    emailResult:
-      lead && lead.emailResult
-        ? lead.emailResult
-        : lead && lead.result
-          ? lead.result
-          : null,
+    emailResult,
   };
 }
 
@@ -288,6 +318,7 @@ function createLeadHandlers(adapter) {
     log("info", eventMessage(adapter, "bg.start"), {
       leadId,
       siteSlug: safeTrim(adapter.siteSlug),
+      durMs: 0,
     });
 
     const existing = await store.getLead(event, leadId);
@@ -413,14 +444,9 @@ function createLeadHandlers(adapter) {
     const lead = await store.getLead(event, leadId);
     if (!lead) return json(404, { status: "error", message: "Not found" });
 
-    return {
-      statusCode: 200,
-      headers: {
-        "content-type": "application/json",
-        "cache-control": "no-store",
-      },
-      body: JSON.stringify(legacyLeadStatusBody(leadId, lead)),
-    };
+    return json(200, leadStatusPayload(leadId, lead), {
+      "cache-control": "no-store",
+    });
   }
 
   async function leadRetry(event) {
