@@ -72,24 +72,39 @@ function extractLeadIdFromEvent(event) {
   return "";
 }
 
+function eventMessage(adapter, suffix) {
+  const slug = safeTrim(adapter && adapter.siteSlug) || "leadkit";
+  return `${slug}.${suffix}`;
+}
+
 function storeNameFor(adapter, env) {
   const e = env || process.env;
   const explicit = safeTrim(e.LEAD_STORE_NAME);
   if (explicit) return explicit;
+  const adapterName = safeTrim(adapter.leadStoreName || adapter.storeName);
+  if (adapterName) return adapterName;
   return `lead-kit-${safeTrim(adapter.siteSlug)}`;
 }
 
-function backgroundPath(env) {
+function backgroundPath(adapter, env) {
   const e = env || process.env;
-  return (
-    safeTrim(e.LEAD_BACKGROUND_PATH) ||
-    "/.netlify/functions/handle-lead-background"
-  );
+  const fromEnv = safeTrim(e.LEAD_BACKGROUND_PATH);
+  if (fromEnv) return fromEnv;
+  const fromAdapter = safeTrim(adapter.backgroundPath);
+  if (fromAdapter) return fromAdapter;
+  return "/.netlify/functions/handle-lead-background";
 }
 
 function maxAttempts(env) {
   const e = env || process.env;
   return toInt(e.LEAD_MAX_ATTEMPTS, 3);
+}
+
+function enqueueTimeoutMs(env) {
+  const e = env || process.env;
+  const ms =
+    safeTrim(e.LEAD_ENQUEUE_TIMEOUT_MS) || safeTrim(e.BG_ENQUEUE_TIMEOUT_MS);
+  return toInt(ms, 8000);
 }
 
 async function getPayloadSchema(adapter) {
@@ -100,31 +115,28 @@ async function getPayloadSchema(adapter) {
   return schema;
 }
 
-function leadStatusResponse(leadId, lead) {
-  const attempt = Number(lead && lead.attempts ? lead.attempts : 0);
-  const error =
-    lead && lead.error
-      ? {
-          stage: safeTrim(lead.stage),
-          message: safeTrim(lead.error.message || "Failed"),
-        }
-      : undefined;
-
+function legacyLeadStatusBody(leadId, lead) {
   return {
-    status: "ok",
-    lead: {
-      leadId,
-      correlationId: safeTrim(lead && lead.correlationId) || leadId,
-      status: safeTrim(lead && lead.status) || "unknown",
-      stage: safeTrim(lead && lead.stage) || "unknown",
-      createdAt: safeTrim(lead && lead.createdAt) || "",
-      updatedAt: safeTrim(lead && lead.updatedAt) || "",
-      doneAt: safeTrim(lead && lead.doneAt) || "",
-      attempts: attempt,
-      attempt,
-      error,
-      result: lead && lead.result ? lead.result : undefined,
-    },
+    leadId,
+    status: safeTrim(lead && lead.status) || "unknown",
+    stage: safeTrim(lead && lead.stage) || "unknown",
+    attempts: Number(lead && lead.attempts ? lead.attempts : 0),
+    updatedAt: safeTrim(lead && lead.updatedAt) || "",
+    doneAt: safeTrim(lead && lead.doneAt) || "",
+    error:
+      lead && lead.error
+        ? { message: safeTrim(lead.error.message) || "Failed" }
+        : null,
+    pdfError:
+      lead && lead.pdfError
+        ? { message: safeTrim(lead.pdfError.message) || "PDF failed" }
+        : null,
+    emailResult:
+      lead && lead.emailResult
+        ? lead.emailResult
+        : lead && lead.result
+          ? lead.result
+          : null,
   };
 }
 
@@ -147,7 +159,7 @@ function createLeadHandlers(adapter) {
     const leadId = randomUUID();
     const correlationId = leadId;
 
-    log("info", "leadkit.fg.start", {
+    log("info", eventMessage(adapter, "fg.start"), {
       siteSlug: safeTrim(adapter.siteSlug),
       leadId,
       path: safeTrim(event.path),
@@ -158,7 +170,7 @@ function createLeadHandlers(adapter) {
     try {
       payload = parseRequestBody(event);
     } catch {
-      log("error", "leadkit.fg.body_invalid", { leadId });
+      log("error", eventMessage(adapter, "fg.body_invalid"), { leadId });
       return json(400, { status: "error", message: "Invalid request body" });
     }
 
@@ -166,7 +178,7 @@ function createLeadHandlers(adapter) {
     const parsed = payloadSchema.safeParse(payload);
 
     if (!parsed.success) {
-      log("info", "leadkit.fg.schema_invalid", { leadId });
+      log("info", eventMessage(adapter, "fg.schema_invalid"), { leadId });
       return json(400, {
         status: "invalid",
         errors: formatIssues(parsed.error.issues),
@@ -186,6 +198,8 @@ function createLeadHandlers(adapter) {
       updatedAt: nowIso(),
       payload: data,
       error: null,
+      pdfError: null,
+      emailResult: null,
       result: null,
     });
 
@@ -197,19 +211,13 @@ function createLeadHandlers(adapter) {
         new Error("Missing WEBSITE_URL"),
         "enqueue",
       );
-      return json(500, {
-        status: "error",
-        message: "Missing WEBSITE_URL",
-        leadId,
-        correlationId,
-        cid: correlationId,
-      });
+      return json(500, { status: "error", message: "Missing WEBSITE_URL" });
     }
 
     let enqueueOk = false;
     try {
       const res = await fetchWithTimeout(
-        `${origin}${backgroundPath(process.env)}`,
+        `${origin}${backgroundPath(adapter, process.env)}`,
         {
           method: "POST",
           headers: {
@@ -218,7 +226,7 @@ function createLeadHandlers(adapter) {
           },
           body: JSON.stringify({ leadId: correlationId }),
         },
-        toInt(process.env.LEAD_ENQUEUE_TIMEOUT_MS, 8000),
+        enqueueTimeoutMs(process.env),
       );
       enqueueOk = res.status === 202 || res.status === 200;
     } catch {
@@ -232,7 +240,7 @@ function createLeadHandlers(adapter) {
         new Error("Background enqueue failed"),
         "enqueue",
       );
-      log("error", "leadkit.fg.enqueue_failed", {
+      log("error", eventMessage(adapter, "fg.enqueue_failed"), {
         leadId,
         durMs: Date.now() - started,
       });
@@ -240,12 +248,13 @@ function createLeadHandlers(adapter) {
         status: "error",
         message: "Background enqueue failed",
         leadId,
-        correlationId,
-        cid: correlationId,
       });
     }
 
-    log("info", "leadkit.fg.queued", { leadId, durMs: Date.now() - started });
+    log("info", eventMessage(adapter, "fg.queued"), {
+      leadId,
+      durMs: Date.now() - started,
+    });
 
     return json(202, {
       status: "queued",
@@ -276,10 +285,9 @@ function createLeadHandlers(adapter) {
     if (!isUuid(leadId))
       return json(400, { status: "error", message: "Invalid leadId" });
 
-    log("info", "leadkit.bg.start", {
+    log("info", eventMessage(adapter, "bg.start"), {
       leadId,
       siteSlug: safeTrim(adapter.siteSlug),
-      durMs: Date.now() - started,
     });
 
     const existing = await store.getLead(event, leadId);
@@ -290,7 +298,7 @@ function createLeadHandlers(adapter) {
         new Error("Missing stored payload"),
         "enqueue",
       );
-      return json(404, { status: "error", message: "Lead not found", leadId });
+      return json(404, { status: "error", message: "Lead not found" });
     }
 
     const payloadSchema = await schema();
@@ -326,15 +334,29 @@ function createLeadHandlers(adapter) {
       const s = safeTrim(stage) || "unknown";
       lastStage = s;
 
-      const patch = { stage: s };
       const m = meta && typeof meta === "object" ? meta : {};
+      const patch = { stage: s };
 
-      if (m && typeof m.error === "string" && safeTrim(m.error)) {
-        patch.error = { message: safeTrim(m.error) };
+      if (s === "pdf_failed") {
+        const errMsg = safeTrim(m.error) || "PDF failed";
+        patch.pdfError = { message: errMsg };
       }
 
-      if (s === "email_ok" && m && safeTrim(m.messageId)) {
-        patch.result = { messageId: safeTrim(m.messageId) };
+      if (s === "pdf_ok") {
+        patch.pdfError = null;
+      }
+
+      if (s === "email_ok") {
+        const messageId = safeTrim(m.messageId);
+        if (messageId) {
+          patch.emailResult = { messageId };
+          patch.result = { messageId };
+        }
+      }
+
+      if (s === "email_failed") {
+        const errMsg = safeTrim(m.error) || "Email failed";
+        patch.error = { message: errMsg };
       }
 
       await store.patchLead(event, leadId, patch);
@@ -354,13 +376,12 @@ function createLeadHandlers(adapter) {
         doneAt: nowIso(),
       });
 
-      log("info", "leadkit.bg.sent", { leadId, durMs: Date.now() - started });
-      return json(200, {
-        status: "ok",
+      log("info", eventMessage(adapter, "bg.sent"), {
         leadId,
-        correlationId: leadId,
-        cid: leadId,
+        durMs: Date.now() - started,
       });
+
+      return json(200, { status: "ok", leadId });
     } catch (e) {
       const ne = store.normalizeError(e) || { message: "Background failed" };
       const stage =
@@ -368,20 +389,17 @@ function createLeadHandlers(adapter) {
         lastStage ||
         safeTrim(existing.stage) ||
         "unknown";
+
       await store.failLead(event, leadId, e, stage);
-      log("error", "leadkit.bg.failed", {
+
+      log("error", eventMessage(adapter, "bg.failed"), {
         leadId,
         stage,
         err: ne.message,
         durMs: Date.now() - started,
       });
-      return json(500, {
-        status: "error",
-        message: ne.message,
-        leadId,
-        correlationId: leadId,
-        cid: leadId,
-      });
+
+      return json(500, { status: "error", message: ne.message, leadId });
     }
   }
 
@@ -393,17 +411,16 @@ function createLeadHandlers(adapter) {
       return json(400, { status: "error", message: "Invalid leadId" });
 
     const lead = await store.getLead(event, leadId);
-    if (!lead) {
-      return json(
-        200,
-        { status: "not_found", leadId, correlationId: leadId, cid: leadId },
-        { "cache-control": "no-store" },
-      );
-    }
+    if (!lead) return json(404, { status: "error", message: "Not found" });
 
-    return json(200, leadStatusResponse(leadId, lead), {
-      "cache-control": "no-store",
-    });
+    return {
+      statusCode: 200,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+      },
+      body: JSON.stringify(legacyLeadStatusBody(leadId, lead)),
+    };
   }
 
   async function leadRetry(event) {
@@ -414,7 +431,7 @@ function createLeadHandlers(adapter) {
     try {
       body = parseRequestBody(event);
     } catch {
-      return json(400, { status: "error", message: "Invalid request body" });
+      body = {};
     }
 
     const leadId = safeTrim(
@@ -429,15 +446,11 @@ function createLeadHandlers(adapter) {
     if (!lead) return json(404, { status: "error", message: "Not found" });
 
     if (safeTrim(lead.status) === "sent")
-      return json(200, {
-        status: "ok",
-        leadId,
-        correlationId: leadId,
-        cid: leadId,
-      });
+      return json(200, { status: "ok", leadId });
 
     const attempts = Number(lead.attempts || 0);
     const limit = maxAttempts(process.env);
+
     if (attempts >= limit) {
       await store.failLead(
         event,
@@ -459,7 +472,7 @@ function createLeadHandlers(adapter) {
       return json(500, { status: "error", message: "Missing WEBSITE_URL" });
 
     const res = await fetchWithTimeout(
-      `${origin}${backgroundPath(process.env)}`,
+      `${origin}${backgroundPath(adapter, process.env)}`,
       {
         method: "POST",
         headers: {
@@ -468,19 +481,14 @@ function createLeadHandlers(adapter) {
         },
         body: JSON.stringify({ leadId }),
       },
-      toInt(process.env.LEAD_ENQUEUE_TIMEOUT_MS, 8000),
+      enqueueTimeoutMs(process.env),
     );
 
     const ok = res.status === 202 || res.status === 200;
     if (!ok)
       return json(500, { status: "error", message: "Retry enqueue failed" });
 
-    return json(202, {
-      status: "queued",
-      leadId,
-      correlationId: leadId,
-      cid: leadId,
-    });
+    return json(202, { status: "queued", leadId });
   }
 
   return { handleLead, handleLeadBackground, leadStatus, leadRetry };
