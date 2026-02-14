@@ -3,11 +3,20 @@
   "version": "1.1.2",
   "main": "./src/index.cjs",
   "type": "commonjs",
+  "types": "./src/index.d.ts",
   "exports": {
-    ".": "./src/index.cjs",
-    "./createLeadHandlers.cjs": "./src/createLeadHandlers.cjs",
-    "./createSubmissionCreatedHandler.cjs": "./src/createSubmissionCreatedHandler.cjs",
-    "./core/*": "./src/core/*"
+    ".": {
+      "require": "./src/index.cjs",
+      "types": "./src/index.d.ts"
+    },
+    "./client": {
+      "import": "./src/client/index.mjs",
+      "types": "./src/client/index.d.ts"
+    },
+    "./site-utils": {
+      "require": "./src/site-utils/index.cjs",
+      "types": "./src/site-utils/index.d.ts"
+    }
   },
   "files": [
     "src/**/*",

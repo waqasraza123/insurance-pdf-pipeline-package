@@ -3,4 +3,10 @@ const {
   createSubmissionCreatedHandler,
 } = require("./createSubmissionCreatedHandler.cjs");
 
-module.exports = { createLeadHandlers, createSubmissionCreatedHandler };
+const siteUtils = require("./site-utils/index.cjs");
+
+module.exports = {
+  createLeadHandlers,
+  createSubmissionCreatedHandler,
+  siteUtils,
+};
