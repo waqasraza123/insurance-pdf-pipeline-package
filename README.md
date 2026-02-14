@@ -1,51 +1,84 @@
-Here’s a **full updated README.md** that bakes in the “don’t forget the contract” mindset, documents the **adapter contract**, adds the **extra exported API** you’re already using (`createSubmissionCreatedHandler`), and adds a **site integration checklist** so future sites don’t drift.
-
 ````md
 # insurance-pdf-pipeline-package
 
 Reusable Netlify lead pipeline kit:
 
-validate -> store -> background -> pdf -> email -> status/retry
+**validate → store → background → pdf → email → status/retry**
 
-This package exists to stop copy/paste pipelines across sites and to keep the lead contract + PDF/email flow consistent.
+This package exists to stop copy/paste pipelines across sites and to keep the **lead contract + PDF/email flow** consistent.
+
+---
 
 ## What you get
 
-Exports:
+### Server exports (CommonJS)
 
-- `createLeadHandlers(adapter)` -> `{ handleLead, handleLeadBackground, leadStatus, leadRetry }`
-- `createSubmissionCreatedHandler(adapter)` -> Netlify Forms “submission-created” webhook handler
+- `createLeadHandlers(adapter)` → `{ handleLead, handleLeadBackground, leadStatus, leadRetry }`
+- `createSubmissionCreatedHandler(adapter)` → Netlify Forms “submission-created” webhook handler
+- `siteUtils` → helper utilities for building email + PDF models
 
-Built-in compat fixes:
+### Client exports (ESM subpath)
 
-- Callback normalization: supports `onStage(stage, meta)` and legacy `onStep({ stage, extra })`
-- leadId/cid aliasing: accepts `leadId`, `cid`, `correlationId` in query/body/headers and returns aliases
+- `insurance-pdf-pipeline-package/client` → optional browser helpers for:
+  - submit lead
+  - save/read leadId
+  - poll status + retry
+  - logo.dev URL builder
+
+Example:
+
+```js
+import {
+  submitLead,
+  pollLeadStatus,
+  retryLead,
+  saveLeadId,
+  getLeadId,
+  buildThankYouUrl,
+  logoDev,
+} from "insurance-pdf-pipeline-package/client";
+```
+````
+
+---
+
+## Built-in compat + stability
+
+- **Callback normalization**: supports `onStage(stage, meta)` and legacy `onStep({ stage, extra })`
+- **LeadId aliasing**: accepts `leadId`, `cid`, `correlationId` in query/body/headers and returns aliases
+- **Best-effort PDF** (configurable): can continue email even if PDF fails
+
+---
 
 ## How the pipeline works
 
-1. **handle-lead** (HTTP)
+### 1) `handle-lead` (HTTP)
 
-- Reads JSON payload
-- Validates via the site adapter schema/parser
-- Normalizes + enriches (pagePath/referrer/utm if you want)
-- Stores lead record
+- Reads JSON payload (or form-encoded)
+- Validates with your site schema (`adapter.getSchema().payloadSchema`)
+- Stores the lead record in a backend store (Netlify Blobs; local file fallback in dev)
 - Enqueues background job and returns `202` with `leadId`
 
-2. **handle-lead-background**
+### 2) `handle-lead-background`
 
-- Loads lead by id
-- Renders PDF (best-effort unless configured otherwise)
+- Loads stored lead by id
+- Runs PDF render (best-effort unless configured)
 - Sends email (PDF required or optional based on env)
-- Updates lead stage/status
+- Updates lead stage/status (for UI polling)
 - Stops after `LEAD_MAX_ATTEMPTS`
 
-3. **lead-status**
+### 3) `lead-status`
 
-- Returns `{ leadId, status, stage, attempts, updatedAt, doneAt, error }`
+Returns a JSON payload with both:
 
-4. **lead-retry**
+- `lead` (full status object for UIs)
+- plus convenient top-level fields (`leadId`, `status`, `stage`, etc.)
 
-- Re-queues the background job if under `LEAD_MAX_ATTEMPTS`
+### 4) `lead-retry`
+
+Re-queues the background job if still under `LEAD_MAX_ATTEMPTS`.
+
+---
 
 ## Install (GitHub dependency)
 
@@ -54,7 +87,8 @@ In your site repo (recommended inside `netlify/functions/package.json` if you ke
 ```bash
 npm i github:<YOUR_GH_ORG>/insurance-pdf-pipeline-package#main
 ```
-````
+
+---
 
 ## Required folder layout in the site repo
 
@@ -78,50 +112,94 @@ public/
     <siteSlug>-print.html
 ```
 
-The shared handlers live in this package. Your site only provides the site-specific contract + rendering + email content.
+Your site provides only the site-specific contract (schema + pdfModel + email template).
+The shared handlers and pipeline logic live in this package.
+
+---
+
+## Minimal Netlify function wrappers
+
+These wrappers stay tiny and don’t drift.
+
+`netlify/functions/handle-lead.cjs`
+
+```js
+const { createLeadHandlers } = require("insurance-pdf-pipeline-package");
+const { adapter } = require("./sites/<siteSlug>/adapter.cjs");
+exports.handler = createLeadHandlers(adapter).handleLead;
+```
+
+`netlify/functions/handle-lead-background.cjs`
+
+```js
+const { createLeadHandlers } = require("insurance-pdf-pipeline-package");
+const { adapter } = require("./sites/<siteSlug>/adapter.cjs");
+exports.handler = createLeadHandlers(adapter).handleLeadBackground;
+```
+
+`netlify/functions/lead-status.cjs`
+
+```js
+const { createLeadHandlers } = require("insurance-pdf-pipeline-package");
+const { adapter } = require("./sites/<siteSlug>/adapter.cjs");
+exports.handler = createLeadHandlers(adapter).leadStatus;
+```
+
+`netlify/functions/lead-retry.cjs`
+
+```js
+const { createLeadHandlers } = require("insurance-pdf-pipeline-package");
+const { adapter } = require("./sites/<siteSlug>/adapter.cjs");
+exports.handler = createLeadHandlers(adapter).leadRetry;
+```
+
+---
 
 ## Adapter contract (what every site must implement)
 
-Your `netlify/functions/sites/<siteSlug>/adapter.cjs` must provide an object the kit can call.
+Your `netlify/functions/sites/<siteSlug>/adapter.cjs` must export:
 
-Minimum responsibilities:
+- `siteSlug` (string)
+- `templatePath` (string; typically `public/pdf/<slug>-print.html`)
+- `leadStoreName` (string; optional but recommended)
+- `getSchema()` (function returning `{ payloadSchema, ... }`)
+- `buildPdfModel(payload)` (function returning a PDF model)
+- `renderLeadEmailHTML(payload, env)` (function returning HTML string)
+- `renderLeadEmailText(payload, env)` (function returning text string)
 
-- Identify the site (slug/name)
-- Validate incoming payload (Zod schema / parse function)
-- Build PDF model from validated payload
-- Provide email template builder (subject/body/attachments metadata) or data needed by the shared sender
-- Provide print template path (public/pdf/<slug>-print.html) and pdf filename conventions
-
-A practical adapter shape looks like this (names may differ slightly depending on your repo, but the responsibilities are fixed):
+Example adapter that matches the package code:
 
 ```js
-module.exports.adapter = {
-  siteSlug: "ti",
+const { buildPdfModel } = require("./pdfModel.cjs");
+const {
+  renderLeadEmailHTML,
+  renderLeadEmailText,
+} = require("./leadTemplate.cjs");
 
-  safeParseLeadPayload(input) {
-    // return { ok: true, data } or { ok: false, error }
-  },
+function getSchema() {
+  return require("./schema.cjs");
+}
 
-  buildPdfModel({ lead, payload, meta }) {
-    // return { meta, sections: [...] } compatible with your print html
-  },
-
-  buildLeadEmail({ lead, payload, pdf, meta }) {
-    // return { subject, html, text, attachments? }
-  },
-
-  pdf: {
-    printTemplatePath: "public/pdf/ti-print.html",
-    filename: "ti-lead.pdf",
-  },
+const adapter = {
+  siteSlug: "<siteSlug>",
+  templatePath: "public/pdf/<siteSlug>-print.html",
+  leadStoreName: "<siteSlug>-leads",
+  getSchema,
+  buildPdfModel,
+  renderLeadEmailHTML,
+  renderLeadEmailText,
 };
+
+module.exports = { adapter };
 ```
 
-If your package version already expects different property names, keep those names — but still follow the same responsibilities. The goal is: **one contract per site**, no missing fields, no ad-hoc hacks.
+If you rename these adapter fields, you are going to break the pipeline.
+
+---
 
 ## The lead contract (do not skip this)
 
-Every site must define its **lead payload schema** in one place and treat it as the source of truth:
+Every site must define its payload schema in one place and treat it as the source of truth:
 
 - `netlify/functions/sites/<siteSlug>/schema.cjs`
 
@@ -129,31 +207,37 @@ Rules that prevent future breakage:
 
 - Preprocess + trim all strings
 - Default optional strings to `""` so PDF/email doesn’t explode on `undefined`
-- Use enums for controlled answers (`YES_NO`, location lists, etc.)
+- Use enums for controlled answers (`YES_NO`, locations, etc.)
 - Encode booleans consistently (recommended: `"yes" | "no"`)
 - If you add a question, you must update:
   - schema
-  - adapter mapping (PDF/email)
+  - pdfModel
+  - leadTemplate
   - frontend payload builder (if applicable)
-  - print template (labels shown in PDF)
+  - print template (if labels/layout change)
+
+---
 
 ## PDF rendering contract
 
 You provide:
 
 - `public/pdf/<siteSlug>-print.html` (static HTML that reads `window.__PDF_MODEL__`)
-- `pdfModel.cjs` (builds `__PDF_MODEL__` shape)
-- The shared renderer in this package opens the print template and injects the model.
+- `pdfModel.cjs` builds a stable model shape
 
-### PDF model shape
+The shared renderer:
 
-Keep it stable across sites:
+- opens the print template in Chromium
+- injects `window.__PDF_MODEL__`
+- prints to PDF
+
+### Recommended PDF model shape
 
 ```js
 {
   meta: {
     createdAt: "2026-02-13T10:00:00Z",
-    source: "toolinsurance.co.nz/get-quotes",
+    source: "your-site/path",
     leadId: "..."
   },
   sections: [
@@ -161,29 +245,31 @@ Keep it stable across sites:
       title: "Applicant",
       rows: [
         { label: "Name", value: "..." },
-        { label: "Email", value: "..." }
+        { label: "Email", value: "..." },
+        { label: "Signature", kind: "image", src: "data:image/png;base64,..." }
       ]
     }
   ]
 }
 ```
 
-If you use images (signatures/logos), use `{ kind: "image", src: "..." }`.
+Images use: `{ kind: "image", src: "..." }`.
+
+---
 
 ## Email sending
 
-The kit sends via SMTP with sane defaults and safe timeouts.
+The kit sends via SMTP with safe defaults + timeouts.
+Email templates are fully site-owned (`renderLeadEmailHTML` + `renderLeadEmailText`).
 
 ### Required env vars
 
 ```
-Email (SMTP)
-
 SMTP_HOST
 SMTP_PORT (default 587)
 SMTP_USER (optional if server allows)
 SMTP_PASS (optional if server allows)
-SMTP_SECURE (optional, defaults to true if port 465 else false)
+SMTP_SECURE (optional; defaults true on 465 else false)
 
 LEAD_TO_EMAIL (comma/semicolon separated)
 LEAD_FROM_EMAIL
@@ -211,40 +297,56 @@ LEAD_EMAIL_INLINE_LOGO=0|1 (default 1)
 LEAD_PDF_FILENAME (default <siteSlug>-lead.pdf)
 ```
 
+---
+
 ## PDF rendering env vars
 
-```
-WEBSITE_URL (preferred) OR Netlify provided URL/DEPLOY_PRIME_URL must exist
+You must have a resolvable origin so Chromium can load the print template:
 
-PDF_RUNTIME=local|lambda (default auto)
-PDF_HEADLESS=0|1 (local only, default 1)
-PDF_RENDER_TIMEOUT_MS (default 25000)
 ```
+WEBSITE_URL (preferred)
+or Netlify-provided URL / DEPLOY_PRIME_URL
+```
+
+Rendering settings:
+
+```
+PDF_RUNTIME=local|lambda (default auto)
+PDF_HEADLESS=0|1 (local only; default 1)
+PDF_RENDER_TIMEOUT_MS (default 25000)
+
+PUPPETEER_EXECUTABLE_PATH (optional override)
+GOOGLE_CHROME_BIN / CHROME_PATH (local fallback discovery)
+```
+
+---
 
 ## Pipeline / store env vars
 
 ```
-LEAD_STORE_NAME (optional, default lead-kit-<siteSlug>)
+LEAD_STORE_NAME (optional; default lead-kit-<siteSlug>)
 LEAD_MAX_ATTEMPTS (default 3)
 
 LEAD_BACKGROUND_PATH (default /.netlify/functions/handle-lead-background)
 LEAD_ENQUEUE_TIMEOUT_MS (default 8000)
 ```
 
+---
+
 ## Netlify Forms integration (submission-created)
 
-There are two common setups:
+There are two common setups.
 
-### A) You only use the pipeline (recommended)
+### A) Pipeline only (recommended)
 
 Frontend posts JSON to `/.netlify/functions/handle-lead`.
 No Netlify Forms required.
 
-### B) You use Netlify Forms + pipeline bridge
+### B) Netlify Forms + pipeline handler
 
-Use `createSubmissionCreatedHandler(adapter)` to convert a Netlify Forms “submission-created” event into the same lead contract and push it through your downstream (CRM/webhook/etc).
+If you use Netlify Forms “submission-created” webhook events:
 
-Example:
+`netlify/functions/submission-created.cjs`
 
 ```js
 const {
@@ -255,21 +357,74 @@ const { adapter } = require("./sites/<siteSlug>/adapter.cjs");
 exports.handler = createSubmissionCreatedHandler(adapter);
 ```
 
-If you do use Netlify Forms, keep the hidden form fields aligned with your schema keys. Drift here is a classic source of “missing fields”.
+The submission data must match your schema keys. Drift here is a classic source of missing fields.
+
+---
 
 ## Frontend integration checklist (Astro/React/etc.)
 
 If you collect leads via a quiz/component:
 
-- Keep a single payload builder that outputs exactly the schema fields
+- Keep one payload builder that outputs exactly the schema fields
 - Use the same enum values as the backend schema
-- Save `leadId` and redirect to thank-you with `?leadId=...`
-- Use `lead-status` UI polling on thank-you if you want visibility
+- Store `leadId` and redirect to thank-you with `?leadId=...`
+- Optionally poll `lead-status` on thank-you and show retry
 
-Recommended:
+### Using the package client helpers (optional)
 
-- Persist `leadId` in sessionStorage
-- Show retry button that calls `lead-retry`
+```js
+import {
+  submitLead,
+  saveLeadId,
+  buildThankYouUrl,
+} from "insurance-pdf-pipeline-package/client";
+
+const res = await submitLead(payload);
+
+if (res.ok) {
+  const leadId =
+    res.body?.leadId || res.body?.correlationId || res.correlationId || "";
+
+  if (leadId)
+    saveLeadId(leadId, {
+      storageKey: "<siteSlug>:lastLeadId",
+      storage: "session",
+    });
+
+  window.location.href = buildThankYouUrl(leadId, {
+    path: "/thank-you",
+    param: "leadId",
+  });
+}
+```
+
+Polling:
+
+```js
+import {
+  getLeadId,
+  pollLeadStatus,
+  retryLead,
+} from "insurance-pdf-pipeline-package/client";
+
+const leadId = getLeadId({ storageKey: "<siteSlug>:lastLeadId" });
+
+if (leadId) {
+  await pollLeadStatus(leadId, {
+    hardStopMs: 60000,
+    onUi: (ui) => {
+      // ui.kind: progress | success | error
+      // ui.canRetry tells you if retry makes sense
+      console.log(ui);
+    },
+    onTerminal: (s) => {
+      console.log("terminal:", s.status, s.stage);
+    },
+  });
+}
+```
+
+---
 
 ## “Do not forget” checklist when adding new mandatory questions
 
@@ -277,53 +432,55 @@ When you add or change questions in any site:
 
 1. Update `netlify/functions/sites/<siteSlug>/schema.cjs`
 
-- Add new fields
-- Add conditional validation rules (`superRefine`) if needed
+- Add fields
+- Add conditional validation (`superRefine`) if needed
 
 2. Update the frontend quiz payload + UI validation
 
 - Add steps/questions
-- Ensure `buildPayload()` sends the new keys
+- Ensure the payload builder sends the new keys
 
 3. Update adapter mapping
 
-- Add those fields to PDF model rows
-- Add those fields to email body/template
+- Add fields to PDF model rows
+- Add fields to email template
 - If you forward to a CRM webhook, map them too
 
 4. Update the print template if labels/layout need changes
 
-- PDF should show the new fields clearly
-
 5. Update any Netlify Forms hidden fields (only if using Forms)
 
-- Add missing `<input name="..." />` keys
+6. Sanity check stages + env
 
-6. Sanity check lead-status stages
-
-- If you made PDF required, set `EMAIL_REQUIRE_PDF=1` intentionally
+- If PDF is mandatory, set `EMAIL_REQUIRE_PDF=1` intentionally
 - Otherwise keep `EMAIL_ALLOW_WITHOUT_PDF=1`
+
+---
 
 ## Common failure modes
 
-- `Missing lead id from server`
-  - Your handle-lead must return `leadId` or `correlationId`. The kit aliases, but you still must return something.
+- **Missing leadId**
+  - If your frontend ignores the `leadId` response, status/retry will not work.
 
-- PDF works locally but fails in Netlify
-  - Ensure `WEBSITE_URL` is set or Netlify URL is available
-  - Ensure chromium runtime is configured for lambda mode (package side)
+- **PDF works locally but fails on Netlify**
+  - Missing `WEBSITE_URL` / Netlify URL
+  - Chromium runtime mismatch (local vs lambda)
+  - Print template path wrong (must resolve at runtime)
 
-- Email sends without PDF unexpectedly
+- **Email sends without PDF unexpectedly**
   - Set `EMAIL_REQUIRE_PDF=1` if PDF must exist
-  - Or keep default behavior if PDF is best-effort
+  - Default behavior is best-effort PDF and still send email
 
-- Validation fails but frontend looks correct
-  - Enum values mismatch (frontend sends “Yes” but schema expects “yes”)
+- **Validation fails but frontend looks correct**
+  - Enum mismatch (frontend sends “Yes” but schema expects “yes”)
+  - Missing conditional fields (only required on some branches)
   - Trim/normalization mismatch
-  - Missing mandatory fields on some branches (conditional steps)
+
+---
 
 ## Versioning and stability
 
 Treat the schema and adapter responsibilities as stable.
 If you change exported names/adapter keys, bump versions and update this README immediately.
+
 This package should reduce drift, not create new surprises.
